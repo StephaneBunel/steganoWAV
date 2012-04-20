@@ -1,4 +1,4 @@
-// Copyright (c) 2012 Stéphane Bunel. All rights reserved.
+// Copyright (C) 2012 Stéphane Bunel. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are met:
@@ -28,6 +28,9 @@
 //-- 2012-04-08, Stéphane Bunel < stephane [@] bunel [.] org >
 //--           * I wrote steganoWAV as an exercise to learn the GO programming
 //--             language. It's my first try ;)
+//-- 2012-04-20, Stéphane Bunel < stephane [@] bunel [.] org >
+//--           * Add new actions: --info and --version
+//--           * TODO: Use memory buffers to drastically speed up hide/extract.
 //
 // Building:
 // go build -ldflags "-s" steganoWAV.go
@@ -42,96 +45,73 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
+	"time"
 )
 
 const (
 	MAJOR    = 1
-	MINOR    = 0
+	MINOR    = 1
 	REVISION = 0
 	APP      = "steganoWAV"
 )
 
+const (
+	ACTION_HELP = iota
+	ACTION_VERSION
+	ACTION_INFO
+	ACTION_EXTRACT
+	ACTION_HIDE
+)
+
 type global_data struct {
-	data_file   string // Path to data file
-	wave_file   string // Path to WAVE/PCM file
-	cmd_extract bool   // Is extract action ?
-	cmd_hide    bool   // Is hide action ?
-	density     uint   // Bits used per bytes to hide data: 1, 2 or 4
-	offset      uint   // In sample. This is your SECRET key
+	action    uint   // Action to run
+	data_file string // Path to data file
+	wave_file string // Path to WAVE/PCM file
+	density   uint32 // Bits used per bytes to hide data: 1, 2, 4 or 8
+	offset    uint32 // In sample. This is one of your SECRET
 }
 
 type wave_info_struct struct {
-	file_type_bloc_id string // ='RIFF'
-	file_size         uint32 // Total file size = file_size + 8
-	file_format_id    string // = 'WAVE
-	format_bloc_id    string // = 'fmt '
-	bloc_size         uint32 // = 16
-	audio_format      uint16 // = 1 for PCM not compressed
-	nbr_cannaux       uint16 //
-	frequence         uint32 //
-	byte_per_sec      uint32 //
-	byte_per_bloc     uint16 //
-	bits_per_sample   uint16 //
-	data_bloc_id      string //
-	data_bloc_size    uint32 //
-	bytes_per_sample  int    // = bits_per_sample >> 3
+	file_type_bloc_id string        // ='RIFF'
+	file_size         uint32        // Total file size = file_size + 8
+	file_format_id    string        // = 'WAVE
+	format_bloc_id    string        // = 'fmt '
+	fmt_bloc_size     uint32        // = 16
+	audio_format      uint32        // = 1 for PCM not compressed
+	nbr_cannaux       uint32        //
+	frequence         uint32        //
+	bytes_per_sec     uint32        //
+	byte_per_bloc     uint32        //
+	bits_per_sample   uint32        //
+	data_bloc_id      string        //
+	data_bloc_size    uint32        //
+	bytes_per_sample  uint32        // = bits_per_sample >> 3
+	total_samples     uint32        // Total number of samples
+	sound_duration    time.Duration //
 }
 
 type wave_handler_struct struct {
-	filename     string           // wave_file
-	file         *os.File         // os.File(wave_file)
-	dataf        *os.File         // os.File(data_file)
-	wave_info    wave_info_struct // wave_info_struct
-	first_sample uint32           // 44
+	filename                    string           // wave_file
+	file                        *os.File         // os.File(wave_file)
+	dataf                       *os.File         // os.File(data_file)
+	wave_info                   wave_info_struct // wave_info_struct
+	first_sample                uint32           // 44
+	samples_for_one_byte        uint32           // # of samples needed to hide a byte
+	max_samples_offset          uint32           // Maximum offset in sample
+	user_offset_to_first_sample uint32           // = gd.offset
+	user_offset_to_first_byte   uint32           // = gd.offset / bytes_per_sample
+	user_samples_space          uint32           // # of usable samples
+	payload_size                uint32           // # of byte that could be hidden in WAVE Audio file
+	user_data_size              uint32           // # of bytes hidden
 }
 
 var (
-	VERSION string = fmt.Sprintf("V%d.%d.%d", MAJOR, MINOR, REVISION)
-	gd             = &global_data{}
+	VERSION   = fmt.Sprintf("%d.%d.%d", MAJOR, MINOR, REVISION)
+	EngSuffix = []string{"B", "KiB", "MiB", "GiB"}
+	gd        = &global_data{}
 )
-
-//-----------------------------------------------------------------------
-// METHODS on *global_data_structure
-//-----------------------------------------------------------------------
-
-// 
-func (self *global_data) init() {
-	var (
-		print_usage bool = false
-	)
-
-	if self.wave_file == "" {
-		fmt.Fprintln(os.Stderr, "-wav is mandatory")
-		print_usage = true
-	}
-
-	if (self.cmd_extract == true && self.cmd_hide == true) ||
-		(self.cmd_extract == false && self.cmd_hide == false) {
-		fmt.Fprintf(os.Stderr, "Need exclusive action: -hide OR -extract\n")
-		print_usage = true
-	}
-
-	if self.cmd_hide && self.data_file == "" {
-		fmt.Fprintln(os.Stderr, "-data is mandatory with -hide action")
-		print_usage = true
-	}
-
-	if print_usage {
-		show_usage()
-		os.Exit(1)
-	}
-}
-
-// Show usage of APP
-func show_usage() {
-	fmt.Fprintf(os.Stderr, "%s %s\n\n", APP, VERSION)
-	fmt.Fprintf(os.Stderr,
-		"Usage of %s:\t -wav=<filename> [-extract] [-hide] "+
-			"[-data=<filename>] [-density=<1|2|4>] [-offset=<uint>]\n\n",
-		os.Args[0])
-	flag.PrintDefaults()
-}
 
 //-----------------------------------------------------------------------
 //-- METHODS on *wave_handler_struct
@@ -140,7 +120,7 @@ func show_usage() {
 // Open and decode/check WAVE Audio file to work with.
 func (self *wave_handler_struct) Open(filename string, write bool) (err error) {
 	var (
-		flags int = os.O_RDONLY
+		flags = os.O_RDONLY
 		f     *os.File
 	)
 
@@ -164,10 +144,48 @@ func (self *wave_handler_struct) Open(filename string, write bool) (err error) {
 	return nil
 }
 
-// Hide put given data into a WAVE Audio file
+// Print some informations about WAV Audio File
+func (self *wave_handler_struct) PrintWAVInfo(output *os.File) (err error) {
+	msg := ""
+
+	sample_dynamic_at_x_percent := 0.1 * math.Pow(2, float64(self.wave_info.bits_per_sample))
+	hiding_dynamic := math.Pow(2, float64(gd.density))
+	max_dist := 100.0 * hiding_dynamic / sample_dynamic_at_x_percent
+
+	hidden_start_time := time.Duration(float64(self.user_offset_to_first_byte)/float64(self.wave_info.bytes_per_sec)) * time.Second
+
+	msg = fmt.Sprintf("WAVE Audio file informations\n")
+	msg += fmt.Sprintf("============================\n")
+	msg += fmt.Sprintf("  File path                      : \"%s\"\n", self.filename)
+	msg += fmt.Sprintf("  File size                      : %s (%d bytes)\n", intToSuffixedStr(self.wave_info.file_size+8), self.wave_info.file_size+8)
+	msg += fmt.Sprintf("  File type                      : %s\n", self.wave_info.file_type_bloc_id)
+	msg += fmt.Sprintf("  RIFF format                    : %s\n", self.wave_info.file_format_id)
+	msg += fmt.Sprintf("  Sound data format              : %d\n", self.wave_info.audio_format)
+	msg += fmt.Sprintf("  Nbr. of channels               : %d\n", self.wave_info.nbr_cannaux)
+	msg += fmt.Sprintf("  Bytes per second               : %s (%d bytes)\n", intToSuffixedStr(self.wave_info.bytes_per_sec), self.wave_info.bytes_per_sec)
+	msg += fmt.Sprintf("  Sample freqency                : %d Hz\n", self.wave_info.frequence)
+	msg += fmt.Sprintf("  Sample size                    : %d bits (%d bytes)\n", self.wave_info.bits_per_sample, self.wave_info.bytes_per_sample)
+	msg += fmt.Sprintf("  Total samples                  : %d\n", self.wave_info.total_samples)
+	msg += fmt.Sprintf("  Sound size                     : %s (%d bytes)\n", intToSuffixedStr(self.wave_info.data_bloc_size), self.wave_info.data_bloc_size)
+	msg += fmt.Sprintf("  Sound duration                 : %v\n", self.wave_info.sound_duration)
+
+	msg += fmt.Sprintf("\nHiding informations\n")
+	msg += fmt.Sprintf("===================\n")
+	msg += fmt.Sprintf("  Density                        : %d bits per sample\n", gd.density)
+	msg += fmt.Sprintf("    Samples for hide one byte    : %d\n", self.samples_for_one_byte)
+	msg += fmt.Sprintf("    Sample alteration @10%% dyn.  : %.5f%%\n", max_dist)
+	msg += fmt.Sprintf("  Max sample offset              : %d\n", self.max_samples_offset)
+	msg += fmt.Sprintf("    User offset                  : %d (%v)\n", self.user_offset_to_first_sample, hidden_start_time)
+	msg += fmt.Sprintf("    Max data size                : %s (%d bytes)\n", intToSuffixedStr(self.payload_size), self.payload_size)
+
+	fmt.Fprintln(output, msg)
+	return nil
+}
+
+// Hide write input data into a WAVE Audio file
 func (self *wave_handler_struct) Hide(offset uint32, input *os.File) (err error) {
 	// Offset is expressed as sample
-	offset *= uint32(self.wave_info.bytes_per_sample)
+	offset *= self.wave_info.bytes_per_sample
 	pos := self.first_sample + offset
 	b := byte(0)
 
@@ -177,24 +195,22 @@ func (self *wave_handler_struct) Hide(offset uint32, input *os.File) (err error)
 	}
 	pos = uint32(newpos)
 
-	// Is there enough space ?
-	size_left := self.wave_info.data_bloc_size - uint32(offset)
-	samples_left := size_left / uint32(self.wave_info.bytes_per_sample)
-	hidden_bytes_left := samples_left / uint32(8/gd.density)
-
 	// Get file size
 	fi, err := input.Stat()
 	if err != nil {
 		return err
 	}
 	data_size := fi.Size()
+	self.user_data_size = uint32(data_size)
+
 	if data_size >= (1 << 33) {
-		return errors.New("WAVE/PCM cannot handle file bigger tha 4Gibi!")
+		return errors.New("WAVE/PCM format cannot handle file bigger tha 4GiB!")
 	}
 
-	if uint32(data_size) > hidden_bytes_left {
-		return errors.New(fmt.Sprintf("Size of data to hide (%d) is bigger than maximum (%d).",
-			data_size, hidden_bytes_left))
+	// Is there enough space ?
+	if uint32(data_size) > self.payload_size {
+		return errors.New(fmt.Sprintf("Size of data to hide (%s) is bigger than maximum (%s).",
+			intToSuffixedStr(uint32(data_size)), intToSuffixedStr(self.payload_size)))
 	}
 
 	// Write data size in first 4 octets
@@ -221,18 +237,17 @@ func (self *wave_handler_struct) Hide(offset uint32, input *os.File) (err error)
 	return nil
 }
 
-// hide_byte Byte is splitted as binary fields and written in necessary samples LSB.
+// hide_byte split byte in binary fields and write it in samples LSB.
 func (self *wave_handler_struct) hide_byte(b byte) (err error) {
 	var (
-		shift                    uint   = gd.density
-		mask                     byte   = (1 << gd.density) - 1
-		samples_to_hide_one_byte uint   = (8 / gd.density)
-		stmp                     []byte = []byte{0}
-		s                        byte   = 0
-		skip                     int64  = int64(self.wave_info.bytes_per_sample) - 1
+		shift        = gd.density
+		mask  byte   = (1 << gd.density) - 1
+		stmp  []byte = []byte{0}
+		s     byte   = 0
+		skip  int64  = int64(self.wave_info.bytes_per_sample) - 1
 	)
 
-	for i := uint(0); i < samples_to_hide_one_byte; i++ {
+	for i := uint32(0); i < self.samples_for_one_byte; i++ {
 		if err = binary.Read(self.file, binary.LittleEndian, &stmp); err != nil {
 			return err
 		}
@@ -283,13 +298,10 @@ func (self *wave_handler_struct) Extract(offset uint32, output *os.File) (err er
 	}
 
 	// Check Consistency of data_size
-	size_left := self.wave_info.data_bloc_size - uint32(offset)
-	samples_left := size_left / uint32(self.wave_info.bytes_per_sample)
-	hidden_bytes_left := samples_left / uint32(8/gd.density)
-	if data_size > hidden_bytes_left {
+	if data_size > self.payload_size {
 		return errors.New(fmt.Sprintf("Consistency error. "+
-			"Size of data to extract (%d) is bigger than maximum (%d). Maybe a wrong offset ?",
-			data_size, hidden_bytes_left))
+			"Size of data to extract (%s) is bigger than maximum (%s) payload. Maybe a wrong offset ?",
+			intToSuffixedStr(data_size), intToSuffixedStr(self.payload_size)))
 	}
 
 	// Extract all data_size bytes
@@ -309,22 +321,22 @@ func (self *wave_handler_struct) Extract(offset uint32, output *os.File) (err er
 // extract_byte read binary fields from samples to recompose a complete byte.
 func (self *wave_handler_struct) extract_byte() (b byte, err error) {
 	var (
-		mask                        = byte(1<<gd.density) - 1
-		shift                       = uint(gd.density)
-		samples_to_extract_one_byte = uint(8 / gd.density)
-		s                           = byte(0)
-		skip                        = int64(self.wave_info.bytes_per_sample) - 1
+		mask  = byte(1<<gd.density) - 1
+		shift = uint(gd.density)
+		s     = byte(0)
+		skip  = int64(self.wave_info.bytes_per_sample) - 1
 	)
 
 	// Loop over samples
-	for i := uint(0); i < samples_to_extract_one_byte; i++ {
-		// Sample is little endian ordered. Only first byte of them is usefull
+	for i := uint32(0); i < self.samples_for_one_byte; i++ {
+		// Sample is little endian ordered. Only first byte of them is useful
 		if err = binary.Read(self.file, binary.LittleEndian, &s); err != nil {
 			return 0, err
 		}
 
 		// skip to next sample
 		self.file.Seek(skip, os.SEEK_CUR)
+
 		// Make space for new bits
 		b <<= shift
 		// Filter sample LSBs and add it to recompose a complete byte. 
@@ -346,24 +358,26 @@ func (self *wave_handler_struct) decodeHeaders() (err error) {
 	var (
 		quad = []byte{0, 0, 0, 0}
 		pos  = int64(0)
+		v16  uint16
+		v32  uint32
 	)
 
+	// RIFF chunk
 	if err = binary.Read(self.file, binary.LittleEndian, &quad); err != nil {
 		return err
 	}
 	self.wave_info.file_type_bloc_id = string(quad[:4])
-	//log.Printf("file_type_bloc_id = \"%s\"\n", info.file_type_bloc_id)
 
+	// <RIFF bloc size>
 	if err = binary.Read(self.file, binary.LittleEndian, &self.wave_info.file_size); err != nil {
 		return err
 	}
-	//log.Printf("file_size = %d + 8\n", info.file_size)
 
+	// WAVE chunk
 	if err = binary.Read(self.file, binary.LittleEndian, &quad); err != nil {
 		return err
 	}
 	self.wave_info.file_format_id = string(quad[:4])
-	//log.Printf("file_format_id = \"%s\"\n", info.file_format_id)
 
 	// The "WAVE" format consists of two subchunks: "fmt " and "data":
 	// The "fmt " subchunk describes the sound data's format:
@@ -371,54 +385,60 @@ func (self *wave_handler_struct) decodeHeaders() (err error) {
 		return err
 	}
 	self.wave_info.format_bloc_id = string(quad[:4])
-	//log.Printf("\nformat_bloc_id = \"%s\"\n", info.format_bloc_id)
 
-	if err = binary.Read(self.file, binary.LittleEndian, &self.wave_info.bloc_size); err != nil {
+	// <fmt bloc size>
+	if err = binary.Read(self.file, binary.LittleEndian, &v32); err != nil {
 		return err
 	}
-	//log.Printf("bloc_size = %d\n", info.bloc_size)
+	self.wave_info.fmt_bloc_size = v32
 
-	// 1 = PCM not compressed    
-	if err = binary.Read(self.file, binary.LittleEndian, &self.wave_info.audio_format); err != nil {
+	// <audio format> 1 = PCM not compressed    
+	if err = binary.Read(self.file, binary.LittleEndian, &v16); err != nil {
 		return err
 	}
-	//log.Printf("audio_format = %d%s\n", info.audio_format, msg)
+	self.wave_info.audio_format = uint32(v16)
 
-	if err = binary.Read(self.file, binary.LittleEndian, &self.wave_info.nbr_cannaux); err != nil {
+	// <# of channels>
+	if err = binary.Read(self.file, binary.LittleEndian, &v16); err != nil {
 		return err
 	}
-	//log.Printf("nbr_cannaux = %d\n", info.nbr_cannaux)
+	self.wave_info.nbr_cannaux = uint32(v16)
 
-	if err = binary.Read(self.file, binary.LittleEndian, &self.wave_info.frequence); err != nil {
+	// <Frequency>
+	if err = binary.Read(self.file, binary.LittleEndian, &v32); err != nil {
 		return err
 	}
-	//log.Printf("frequence = %d\n", info.frequence)
+	self.wave_info.frequence = v32
 
-	if err = binary.Read(self.file, binary.LittleEndian, &self.wave_info.byte_per_sec); err != nil {
+	// <Bytes per second>
+	if err = binary.Read(self.file, binary.LittleEndian, &v32); err != nil {
 		return err
 	}
-	//log.Printf("byte_per_sec = %d\n", info.byte_per_sec)
+	self.wave_info.bytes_per_sec = v32
 
-	if err = binary.Read(self.file, binary.LittleEndian, &self.wave_info.byte_per_bloc); err != nil {
+	// <byte per bloc>
+	if err = binary.Read(self.file, binary.LittleEndian, &v16); err != nil {
 		return err
 	}
-	//log.Printf("byte_per_bloc = %d\n", info.byte_per_bloc)
+	self.wave_info.byte_per_bloc = uint32(v16)
 
-	if err = binary.Read(self.file, binary.LittleEndian, &self.wave_info.bits_per_sample); err != nil {
+	// <Bits per sample>
+	if err = binary.Read(self.file, binary.LittleEndian, &v16); err != nil {
 		return err
 	}
-	//log.Printf("bits_per_sample = %d\n", info.bits_per_sample)
+	self.wave_info.bits_per_sample = uint32(v16)
 
+	// DATA
 	if err = binary.Read(self.file, binary.LittleEndian, &quad); err != nil {
 		return err
 	}
 	self.wave_info.data_bloc_id = string(quad[:4])
-	//log.Printf("\ndata_bloc_id = \"%s\"\n", info.data_bloc_id)
 
-	if err = binary.Read(self.file, binary.LittleEndian, &self.wave_info.data_bloc_size); err != nil {
+	// <data_bloc_size>
+	if err = binary.Read(self.file, binary.LittleEndian, &v32); err != nil {
 		return err
 	}
-	//log.Printf("data_bloc_Size = %d\n", info.data_bloc_size)
+	self.wave_info.data_bloc_size = v32
 
 	// Store the first sample position (=44 for canonical WAVE Audio file)
 	pos, _ = self.file.Seek(0, os.SEEK_CUR)
@@ -433,7 +453,36 @@ func (self *wave_handler_struct) decodeHeaders() (err error) {
 			"PCM (not compressed).")
 	}
 
-	self.wave_info.bytes_per_sample = int(self.wave_info.bits_per_sample >> 3)
+	if gd.density > self.wave_info.bits_per_sample/2 {
+		return errors.New("Density is too high for sample size of this WAVE Audio file.")
+	}
+
+	// Compute some values
+
+	self.wave_info.bytes_per_sample = self.wave_info.bits_per_sample >> 3
+	//fmt.Printf("self.wave_info.bytes_per_sample = %v\n", self.wave_info.bytes_per_sample)
+
+	self.wave_info.total_samples = self.wave_info.data_bloc_size / self.wave_info.bytes_per_sample
+	self.wave_info.sound_duration = time.Duration(float64(self.wave_info.data_bloc_size)/float64(self.wave_info.bytes_per_sec)) * time.Second
+
+	self.user_offset_to_first_sample = gd.offset
+	//fmt.Printf("self.user_samples_offset = %v\n", self.user_samples_offset)
+
+	self.user_offset_to_first_byte = gd.offset * self.wave_info.bytes_per_sample
+	//fmt.Printf("self.user_bytes_offset = %v\n", self.user_bytes_offset)
+
+	self.samples_for_one_byte = 8 / gd.density
+	self.max_samples_offset = self.wave_info.total_samples - (8 * self.samples_for_one_byte)
+
+	payload_samples_space := self.wave_info.total_samples - self.user_offset_to_first_sample
+	self.payload_size = payload_samples_space / self.samples_for_one_byte
+
+	// self.max_hiding_capacity = self.wave_info.total_samples / self.samples_for_one_byte
+	// self.offseted_hiding_capacity = self.max_hiding_capacity - (self.user_samples_offset / self.samples_for_one_byte)
+
+	if self.user_offset_to_first_sample >= self.max_samples_offset {
+		return errors.New("Offset is to big! Retry with bigger WAVE Audio file or reduce offset.")
+	}
 
 	return nil
 }
@@ -449,45 +498,173 @@ func (self *wave_handler_struct) free() {
 }
 
 func main() {
-	var (
-		wh    = &wave_handler_struct{}
-		dataf *os.File
-		err   error
-	)
+	var wh = &wave_handler_struct{}
+	var dataf *os.File
+	var err error
 
-	// Parse command line arguments 
-	flag.BoolVar(&gd.cmd_extract, "extract", false, "Extract hidden data from WAV Audio file to stdout")
-	flag.BoolVar(&gd.cmd_hide, "hide", false, "Hide data into WAV Audio file")
-	flag.StringVar(&gd.wave_file, "wave", "", "WAVE Audio file to work with")
-	flag.StringVar(&gd.data_file, "data", "", "File containing data to hide")
-	flag.UintVar(&gd.density, "density", 2, "Bits used per sample: 1, 2 or 4")
-	flag.UintVar(&gd.offset, "offset", 0, "Sample offset. *Offset is your secret key!*")
-	flag.Usage = show_usage
-	flag.Parse()
+	// Read cmd line arguments
+	parseArgs()
+	defer wh.free()
 
-	// Init global data structure
-	gd.init()
-
-	// Open WAVE Audio file
-	if err = wh.Open(gd.wave_file, gd.cmd_hide); err != nil {
-		log.Fatal(fmt.Sprintf("Cannot open \"%s\": %s\n", gd.wave_file, err))
-	}
-
-	// Execute action
 	switch {
-	case gd.cmd_extract:
+	case gd.action == ACTION_HELP:
+		show_usage()
+		os.Exit(0)
+	case gd.action == ACTION_VERSION:
+		fmt.Println(APP + " (" + os.Args[0] + ") " + VERSION + ".")
+		fmt.Println("Copyright (C) 2012 Stéphane Bunel.")
+		fmt.Println("License: BSD style, which is included in the source code.")
+		fmt.Println("\n")
+		os.Exit(0)
+	case gd.action == ACTION_INFO:
+		if err = wh.Open(gd.wave_file, false); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to open \"%s\": %s\n", gd.wave_file, err)
+			break
+		}
+
+		if err = wh.PrintWAVInfo(os.Stdout); err != nil {
+			log.Fatal(fmt.Sprintf("%s\n", err))
+		}
+	case gd.action == ACTION_EXTRACT:
+		if err = wh.Open(gd.wave_file, false); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to open \"%s\": %s\n", gd.wave_file, err)
+			break
+		}
+
 		if err = wh.Extract(uint32(gd.offset), os.Stdout); err != nil {
 			log.Fatal(fmt.Sprintf("%s\n", err))
 		}
-	case gd.cmd_hide:
+	case gd.action == ACTION_HIDE:
+		if err = wh.Open(gd.wave_file, true); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to open \"%s\": %s\n", gd.wave_file, err)
+			break
+		}
+
 		// Open DATA file
 		if dataf, err = os.OpenFile(gd.data_file, os.O_RDONLY, 0); err == nil {
+			defer dataf.Close()
+
 			if err = wh.Hide(uint32(gd.offset), dataf); err != nil {
-				log.Fatal(fmt.Sprintf("%s\n", err))
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				break
 			}
+
+			first_sample := wh.user_offset_to_first_sample
+			last_sample := first_sample + (wh.user_data_size * wh.samples_for_one_byte)
+			fmt.Printf("Start %d, end %d\n", first_sample, last_sample)
+
 		} else {
-			log.Fatal(fmt.Sprintf("Cannot open \"%s\": \"%s\"\n", gd.data_file, err))
+			fmt.Fprintf(os.Stderr, "Failed to open \"%s\": %s\n", gd.data_file, err)
 		}
 	}
-	wh.free()
+}
+
+func parseArgs() {
+	var print_usage = false
+
+	// Parse command line arguments
+	flag.Usage = show_usage
+	bExtract := flag.Bool("extract", false, "")
+	bHide := flag.Bool("hide", false, "")
+	bInfo := flag.Bool("info", false, "")
+	bVersion := flag.Bool("version", false, "")
+
+	flag.StringVar(&gd.wave_file, "wave", "", "")
+	flag.StringVar(&gd.data_file, "data", "", "")
+	flag.StringVar(&gd.data_file, "payload", "", "")
+
+	density := flag.Uint64("density", 2, "")
+	offset := flag.Uint64("offset", 0, "")
+
+	flag.Parse()
+
+	gd.density = uint32(*density)
+	gd.offset = uint32(*offset)
+
+	gd.action = ACTION_HELP
+	if *bHide == true {
+		gd.action = ACTION_HIDE
+	}
+	if *bExtract == true {
+		gd.action = ACTION_EXTRACT
+	}
+	if *bInfo == true {
+		gd.action = ACTION_INFO
+	}
+	if *bVersion == true {
+		gd.action = ACTION_VERSION
+	}
+
+	switch gd.density {
+	case 1, 2, 4, 8:
+	default:
+		fmt.Fprintf(os.Stderr, "Bad value (%v) for -density. Must be 2, 4 or 8. Default: 2\n", gd.density)
+		print_usage = true
+	}
+
+	if (gd.action == ACTION_INFO || gd.action == ACTION_EXTRACT || gd.action == ACTION_HIDE) && gd.wave_file == "" {
+		fmt.Fprintln(os.Stderr, "Option --wave=<filename> is mandatory for this action.")
+		print_usage = true
+	}
+
+	if (gd.action == ACTION_HIDE || gd.action == ACTION_EXTRACT) && gd.offset == 0 {
+		fmt.Fprintln(os.Stderr, "Option --offset=<integer> is mandatory for this action.")
+		print_usage = true
+	}
+
+	if gd.action == ACTION_HIDE && gd.data_file == "" {
+		fmt.Fprintln(os.Stderr, "Option --data=<filename> is mandatory for this action.")
+		print_usage = true
+	}
+
+	if print_usage {
+		show_usage()
+		os.Exit(1)
+	}
+}
+
+// Show usage of APP
+func show_usage() {
+	fmt.Fprintf(os.Stderr, "\n%s %s\n", APP, VERSION)
+	fmt.Fprintf(os.Stderr,
+		"Usage                  : %s <ACTION> [<OPTIONS>]\n\n", os.Args[0])
+	fmt.Fprintln(os.Stderr, "ACTIONS:")
+	fmt.Fprintln(os.Stderr,
+		"  --help               : Show this command summary.\n"+
+			"  --version            : Show version informations.\n"+
+			"  --info               : Print informations about given WAVE Audio file (need --wave option).\n"+
+			"  --extract            : Extract data from given WAVE Audio file to stdout (need --wave, --offset options).\n"+
+			"  --hide               : Hide data into given WAVE Audio file (need --payload, --wave, --offset options).\n")
+
+	fmt.Fprintln(os.Stderr, "OPTIONS:")
+	fmt.Fprintln(os.Stderr,
+		"  --wave=<filename>    : Path to WAVE Audio file.\n"+
+			"  --payload=<filename> : Path to file containing data to hide.\n"+
+			"  --density=<integer>  : Must be 1, 2, 4 or 8 (default to 2).\n"+
+			"  --offset=<integer>   : Must be > 0. This is one of your SECRET.\n")
+
+	fmt.Fprintln(os.Stderr, "Examples:")
+	fmt.Fprintln(os.Stderr, "  Get informations about capsule:")
+	fmt.Fprintln(os.Stderr, "  $ steganoWAV --info --wave=boris24.2.wav --density=4 --offset=5432\n")
+	fmt.Fprintln(os.Stderr, "  Hide source code of steganoWAV:")
+	fmt.Fprintln(os.Stderr, "  $ steganoWAV --hide --wave=boris24.2.wav --density=4 --offset=5432 --data=steganoWAV.go\n")
+	fmt.Fprintln(os.Stderr, "  Extract source code to stdout:")
+	fmt.Fprintln(os.Stderr, "  $ steganoWAV --extract --wave=boris24.2.wav --density=4 --offset=5432\n")
+}
+
+func intToSuffixedStr(value uint32) (result string) {
+	var engorder = 0
+	var tempv = float64(value)
+
+	for {
+		if value > 1024 {
+			engorder += 1
+			value >>= 10
+			tempv /= 1024
+		} else {
+			break
+		}
+	}
+
+	return fmt.Sprintf("%.3f %s", tempv, EngSuffix[engorder])
 }
