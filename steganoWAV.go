@@ -38,6 +38,11 @@
 //-- 2012-04-22, Stéphane Bunel < stephane [@] bunel [.] org >
 //--           * Improve RIFF/WAVE parser to skip unknown chunk.
 //--           * Version 1.2.1
+//-- 2012-04-23, Stéphane Bunel < stephane [@] bunel [.] org >
+//--           * Add new option: --obfuscate
+//--             Use a Fibonacci generator to obfuscate payload
+//--           * Now, by default, density is auto calculated if not given as option.             
+//--           * version 1.3.0
 //
 // Building:
 // go build -ldflags "-s" steganoWAV.go
@@ -52,7 +57,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"os"
 	"time"
@@ -60,8 +64,8 @@ import (
 
 const (
 	MAJOR    = 1
-	MINOR    = 2
-	REVISION = 1
+	MINOR    = 3
+	REVISION = 0
 	APP      = "steganoWAV"
 )
 
@@ -82,10 +86,11 @@ type global_data struct {
 	wave_file string // Path to WAVE/PCM file
 	density   uint32 // Bits used per bytes to hide data: 1, 2, 4 or 8
 	offset    uint32 // In sample. This is one of your SECRET
+	obfuscate uint8  // Fibonacci generator for payload obfuscation 
 }
 
 type wave_info_struct struct {
-	audio_format       uint32 // = 1 for PCM not compressed
+	audio_format       uint32 // == 1 for PCM not compressed
 	num_channels       uint32 //
 	sampling_frequency uint32 //
 	bytes_per_sec      uint32 //
@@ -93,7 +98,8 @@ type wave_info_struct struct {
 	bits_per_sample    uint32 //
 	data_bloc_size     uint32 //
 	// Computed values
-	canonical        bool
+	canonical        bool          // true if fmt chunk size == 16
+	extra_chunk      bool          // true if an extra chunk was skipped
 	bytes_per_sample uint32        // = bits_per_sample >> 3
 	num_samples      uint32        // Total number of samples
 	sound_duration   time.Duration //
@@ -107,15 +113,17 @@ type wave_handler_struct struct {
 	wave_start_offset          uint32           // = gd.offset counted in sample
 	wave_start_offset_in_bytes uint32           // = gd.offset * wave_info.bytes_per_sample
 	wave_first_sample_pos      uint32           // 44 for canonical RIFF/WAVE
-	//
-	payload_file_name string   // Path to data file
-	payload_file_size int64    //
-	payload_file      *os.File // *os.File
-	payload_max_size  uint32   // # of byte that could be hidden in WAVE Audio file
-	//
-	bloc_size            uint32 // Read data by bloc_size step ! Must be set at struct creation
-	samples_for_one_byte uint32 // # of samples needed to hide a byte
-	wave_max_offset      uint32 // Maximum offset to write one SampleBloc + bloc size
+	payload_file_name          string           // Path to data file
+	payload_file_size          int64            // Should be < 2^32
+	payload_file               *os.File         // *os.File
+	payload_max_size           uint32           // # of byte that could be hidden in WAVE Audio file
+	payload_obfuscation_seed   uint8            // If != 0 then use a Fibonacci generator to Steg/Unsteg payload bloc
+	bloc_size                  uint32           // Read data by bloc_size step ! Must be set at struct creation
+	samples_for_one_byte       uint32           // # of samples needed to hide a byte
+	wave_max_offset            uint32           // Maximum offset to write one SampleBloc + bloc size
+	density                    uint32           // Number of bits used per sample to hide payload
+	obfuscate                  bool             // If true then use a Fibonacci generator to obfuscate Steg payload.
+	fib_2, fib_1               uint8            // Fibonnacci registers
 }
 
 var (
@@ -128,7 +136,7 @@ var (
 //-- METHODS on *wave_handler_struct
 //-----------------------------------------------------------------------
 
-// OpenWave Open the WAVE Audio file and reads header
+// OpenWave Opens the WAVE Audio file then parse headers and computes some values.
 func (self *wave_handler_struct) OpenWave(filename string, write bool) (err error) {
 	var flags = os.O_RDONLY
 
@@ -157,7 +165,7 @@ func (self *wave_handler_struct) OpenWave(filename string, write bool) (err erro
 	return nil
 }
 
-// OpenPayload Open the payload file
+// OpenPayload Opens the payload file.
 func (self *wave_handler_struct) OpenPayload(filename string) (err error) {
 	var (
 		f         *os.File
@@ -185,12 +193,12 @@ func (self *wave_handler_struct) OpenPayload(filename string) (err error) {
 	return nil
 }
 
-// Print some informations about WAV Audio File
+// PrintWAVInfo prints some informations about WAV Audio File and hidding.
 func (self *wave_handler_struct) PrintWAVInfo(output *os.File) (err error) {
 	msg := ""
 
 	sample_dynamic_at_x_percent := 0.15 * math.Pow(2, float64(self.wave_info.bits_per_sample))
-	hiding_dynamic := math.Pow(2, float64(gd.density))
+	hiding_dynamic := math.Pow(2, float64(self.density))
 	max_dist := 100.0 * hiding_dynamic / sample_dynamic_at_x_percent
 
 	hidden_start_time := time.Duration(float64(self.wave_start_offset_in_bytes)/float64(self.wave_info.bytes_per_sec)) * time.Second
@@ -199,20 +207,20 @@ func (self *wave_handler_struct) PrintWAVInfo(output *os.File) (err error) {
 	msg += fmt.Sprintf("============================\n")
 	msg += fmt.Sprintf("  File path                      : \"%s\"\n", self.wave_file_name)
 	msg += fmt.Sprintf("  File size                      : %s (%d bytes)\n", intToSuffixedStr(uint32(self.wave_file_size)), self.wave_file_size)
-	//msg += fmt.Sprintf("  Canonical format               : %v\n", self.wave_info.canonical)
+	msg += fmt.Sprintf("  Canonical format               : %v\n", self.wave_info.canonical && !self.wave_info.extra_chunk)
 	msg += fmt.Sprintf("  Audio format                   : %d\n", self.wave_info.audio_format)
 	msg += fmt.Sprintf("  Number of channels             : %d\n", self.wave_info.num_channels)
 	msg += fmt.Sprintf("  Sampling rate                  : %d Hz\n", self.wave_info.sampling_frequency)
 	msg += fmt.Sprintf("  Bytes per second               : %s (%d bytes)\n", intToSuffixedStr(self.wave_info.bytes_per_sec), self.wave_info.bytes_per_sec)
 	msg += fmt.Sprintf("  Sample size                    : %d bits (%d bytes)\n", self.wave_info.bits_per_sample, self.wave_info.bytes_per_sample)
 	// Computed values:
-	msg += fmt.Sprintf("  Total samples                  : %d\n", self.wave_info.num_samples)
+	msg += fmt.Sprintf("  Number of samples              : %d\n", self.wave_info.num_samples)
 	msg += fmt.Sprintf("  Sound size                     : %s (%d bytes)\n", intToSuffixedStr(self.wave_info.data_bloc_size), self.wave_info.data_bloc_size)
 	msg += fmt.Sprintf("  Sound duration                 : %v\n", self.wave_info.sound_duration)
 	//
 	msg += fmt.Sprintf("\nHiding informations\n")
 	msg += fmt.Sprintf("===================\n")
-	msg += fmt.Sprintf("  Density                        : %d bits per sample\n", gd.density)
+	msg += fmt.Sprintf("  Density                        : %d bits per sample\n", self.density)
 	msg += fmt.Sprintf("    Samples for hide one byte    : %d\n", self.samples_for_one_byte)
 	msg += fmt.Sprintf("    Sample alteration @15%% dyn.  : %.5f%% max.\n", max_dist)
 	msg += fmt.Sprintf("  Max samples offset             : %d\n", self.wave_max_offset)
@@ -223,7 +231,7 @@ func (self *wave_handler_struct) PrintWAVInfo(output *os.File) (err error) {
 	return nil
 }
 
-// HidePayload do it's job ;)
+// HidePayload
 func (self *wave_handler_struct) HidePayload(sample_offset uint32) (err error) {
 	var (
 		payload_bloc_size  = self.bloc_size
@@ -236,7 +244,7 @@ func (self *wave_handler_struct) HidePayload(sample_offset uint32) (err error) {
 		samples_bytes_read int
 	)
 
-	// Go to desired samples
+	// Seek to desired sample offset
 	if s_pos, err = self.wave_file.Seek(int64(s_pos), os.SEEK_SET); err != nil {
 		return err
 	}
@@ -306,6 +314,7 @@ func (self *wave_handler_struct) HidePayload(sample_offset uint32) (err error) {
 	return nil
 }
 
+// Extract payload
 func (self *wave_handler_struct) ExtractPayload(offset uint32, output *os.File) (err error) {
 	var (
 		payload_bloc_size  = self.bloc_size
@@ -369,7 +378,7 @@ func (self *wave_handler_struct) ExtractPayload(offset uint32, output *os.File) 
 	return nil
 }
 
-// parseHeaders parse the file headers and collect informations.
+// parseHeaders parses the file headers and collect informations.
 func (self *wave_handler_struct) parseHeaders() (err error) {
 	/*
 	 * http://www.lightlink.com/tjweber/StripWav/WAVE.html#WAVE
@@ -436,6 +445,7 @@ func (self *wave_handler_struct) parseHeaders() (err error) {
 			self.wave_info.data_bloc_size = uint32(chunklen)
 		default:
 			//fmt.Fprintf(os.Stderr, "Skip unused chunk \"%s\" (%d bytes).\n", chunk, v32)
+			self.wave_info.extra_chunk = true
 			if _, err = wave_file.Seek(int64(chunklen), os.SEEK_CUR); err != nil {
 				return err
 			}
@@ -447,6 +457,18 @@ func (self *wave_handler_struct) parseHeaders() (err error) {
 		return errors.New("Only PCM (not compressed) format is supported.")
 	}
 
+	// Auto density ?
+	if self.density == 0 {
+		switch {
+		case self.wave_info.bits_per_sample >= 24:
+			self.density = 8
+		case self.wave_info.bits_per_sample == 16:
+			self.density = 4
+		default:
+			self.density = 1
+		}
+	}
+
 	// Compute some useful values
 	self.wave_info.bytes_per_sample = self.wave_info.bits_per_sample >> 3
 	self.wave_info.num_samples = self.wave_info.data_bloc_size / self.wave_info.bytes_per_sample
@@ -455,7 +477,7 @@ func (self *wave_handler_struct) parseHeaders() (err error) {
 	self.wave_start_offset = gd.offset
 	self.wave_start_offset_in_bytes = gd.offset * self.wave_info.bytes_per_sample
 
-	self.samples_for_one_byte = 8 / gd.density
+	self.samples_for_one_byte = 8 / self.density
 
 	// Samples needed to store at least ONE payload bloc + size of payload
 	val := (4 * self.samples_for_one_byte) + (self.bloc_size * self.samples_for_one_byte)
@@ -529,22 +551,24 @@ func (self *wave_handler_struct) parseChunkFmt() (err error) {
 	return nil
 }
 
-// UnstegBloc extract payload. Payload bloc is write in place - slices are passed by reference
-// Len of SampleBloc MUST be samples_for_one_byte aligned!
+// UnstegBloc extracts payload.
+// Len of SampleBloc MUST be samples_for_one_byte aligned.
 func (self *wave_handler_struct) UnstegBloc(samples *SamplesBloc, payload *PayloadBloc) (p_len uint32) {
 	var (
 		s_pos  uint32
 		s_len  = uint32(len(*samples))
 		s_skip = self.wave_info.bytes_per_sample
-		s_mask = byte(1<<gd.density) - 1
+		s_mask = byte(1<<self.density) - 1
 		s      byte
 	)
 
 	var (
 		p_pos   uint32
-		p_shift = gd.density
+		p_shift = self.density
 		p       byte
 	)
+
+	var fib uint8
 
 	for n := s_len / self.wave_info.bytes_per_sample / self.samples_for_one_byte; n != 0; n-- {
 
@@ -560,6 +584,13 @@ func (self *wave_handler_struct) UnstegBloc(samples *SamplesBloc, payload *Paylo
 			p |= s & s_mask
 		}
 
+		if self.obfuscate {
+			fib = self.fib_1 + self.fib_2
+			self.fib_2 = self.fib_1
+			self.fib_1 = fib
+			p ^= fib
+		}
+
 		// Store payload
 		(*payload)[p_pos] = p
 		p_pos++
@@ -568,29 +599,39 @@ func (self *wave_handler_struct) UnstegBloc(samples *SamplesBloc, payload *Paylo
 	return p_pos
 }
 
-// StegBloc hide payload in samples. Samples is modified in place because slices are passed by reference
+// StegBloc hides payload in samples.
 func (self *wave_handler_struct) StegBloc(payload *PayloadBloc, samples *SamplesBloc) {
 	// Payload vars
 	var (
 		p_pos   uint32
 		p_len   = uint32(len(*payload))
 		p_byte  byte
-		p_shift = gd.density
+		p_shift = self.density
 	)
 
 	// Samples vars
 	var (
 		s_pos   uint32
 		s_byte  byte
-		s_mask  byte = ^((1 << gd.density) - 1)
+		s_mask  byte = ^((1 << self.density) - 1)
 		s_skip       = self.wave_info.bytes_per_sample
-		s_shift      = 8 - gd.density
+		s_shift      = 8 - self.density
 	)
+
+	// Obfuscation vars
+	var fib uint8
 
 	for ; p_len != 0; p_len-- {
 		// Read payload byte
 		p_byte = (*payload)[p_pos]
 		p_pos++
+
+		if self.obfuscate {
+			fib = self.fib_1 + self.fib_2
+			self.fib_2 = self.fib_1
+			self.fib_1 = fib
+			p_byte ^= fib
+		}
 
 		//Steg with sample LSB byte
 		for i := uint32(0); i < self.samples_for_one_byte; i++ {
@@ -611,7 +652,7 @@ func (self *wave_handler_struct) StegBloc(payload *PayloadBloc, samples *Samples
 	}
 }
 
-// free allocated ressources
+// Free allocated ressources
 func (self *wave_handler_struct) Free() {
 	if self.payload_file != nil {
 		self.payload_file.Close()
@@ -620,7 +661,6 @@ func (self *wave_handler_struct) Free() {
 	if self.wave_file != nil {
 		self.wave_file.Close()
 	}
-
 }
 
 func main() {
@@ -632,6 +672,13 @@ func main() {
 	parseArgs()
 	defer wh.Free()
 
+	// Init wh
+	wh.density = gd.density
+	wh.fib_2 = gd.obfuscate
+	wh.fib_1 = gd.obfuscate
+	wh.obfuscate = gd.obfuscate != 0
+
+	// Switch over options
 	switch {
 	case gd.action == ACTION_HELP:
 		show_usage()
@@ -648,7 +695,8 @@ func main() {
 		}
 
 		if err = wh.PrintWAVInfo(os.Stdout); err != nil {
-			log.Fatal(fmt.Sprintf("%s\n", err))
+			fmt.Fprintf(os.Stderr, "%s\n", err)
+			break
 		}
 		os.Exit(0)
 	case gd.action == ACTION_EXTRACT:
@@ -658,7 +706,8 @@ func main() {
 		}
 
 		if err = wh.ExtractPayload(uint32(gd.offset), os.Stdout); err != nil {
-			log.Fatal(fmt.Sprintf("%s\n", err))
+			fmt.Fprintf(os.Stderr, "%s\n", err)
+			break
 		}
 		os.Exit(0)
 	case gd.action == ACTION_HIDE:
@@ -667,8 +716,8 @@ func main() {
 			break
 		}
 
-		if gd.density > wh.wave_info.bits_per_sample/2 {
-			fmt.Fprintf(os.Stderr, "Density of %d is too high for sample size of %d bits.\n", gd.density,
+		if wh.density > wh.wave_info.bits_per_sample/2 {
+			fmt.Fprintf(os.Stderr, "Density of %d is too high for sample size of %d bits.\n", wh.density,
 				wh.wave_info.bits_per_sample)
 			break
 		}
@@ -697,6 +746,7 @@ func main() {
 	os.Exit(1)
 }
 
+// parseArgs parses command line arguments
 func parseArgs() {
 	var print_usage = false
 
@@ -711,13 +761,15 @@ func parseArgs() {
 	flag.StringVar(&gd.data_file, "data", "", "")
 	flag.StringVar(&gd.data_file, "payload", "", "")
 
-	density := flag.Uint64("density", 4, "")
+	density := flag.Uint64("density", 0, "")
 	offset := flag.Uint64("offset", 0, "")
+	obfuscate := flag.Uint64("obfuscate", 0, "")
 
 	flag.Parse()
 
 	gd.density = uint32(*density)
 	gd.offset = uint32(*offset)
+	gd.obfuscate = uint8(*obfuscate)
 
 	gd.action = ACTION_HELP
 	if *bHide == true {
@@ -734,9 +786,9 @@ func parseArgs() {
 	}
 
 	switch gd.density {
-	case 1, 2, 4, 8:
+	case 0, 1, 2, 4, 8:
 	default:
-		fmt.Fprintf(os.Stderr, "Bad value (%v) for -density. Must be 2, 4 or 8. Default: 2\n", gd.density)
+		fmt.Fprintf(os.Stderr, "Bad value (%v) for -density. See --help\n", gd.density)
 		print_usage = true
 	}
 
@@ -761,7 +813,7 @@ func parseArgs() {
 	}
 }
 
-// Show usage of APP
+// Show usage of steganoWAV
 func show_usage() {
 	fmt.Fprintf(os.Stderr, "\n%s %s\n", APP, VERSION)
 	fmt.Fprintf(os.Stderr,
@@ -769,27 +821,29 @@ func show_usage() {
 	fmt.Fprintln(os.Stderr, "ACTIONS:")
 	fmt.Fprintln(os.Stderr,
 		"  --help               : Show this command summary.\n"+
-			"  --version            : Show version informations.\n"+
-			"  --info               : Print informations about given WAVE Audio file (need --wave option).\n"+
-			"  --extract            : Extract data from given WAVE Audio file to stdout (need --wave, --offset options).\n"+
-			"  --hide               : Hide data into given WAVE Audio file (need --payload, --wave, --offset options).\n")
+			"  --version             : Show version informations.\n"+
+			"  --info                : Print informations about given WAVE Audio file (need --wave option).\n"+
+			"  --extract             : Extract data from given WAVE Audio file to stdout (need --wave, --offset options).\n"+
+			"  --hide                : Hide data into given WAVE Audio file (need --payload, --wave, --offset options).\n")
 
 	fmt.Fprintln(os.Stderr, "OPTIONS:")
 	fmt.Fprintln(os.Stderr,
 		"  --wave=<filename>    : Path to WAVE/PCM Audio file.\n"+
-			"  --payload=<filename> : Path to file containing data to hide.\n"+
-			"  --density=<integer>  : Must be 1, 2, 4 or 8 (default to 4).\n"+
-			"  --offset=<integer>   : Must be > 0. This is one of your SECRET.\n")
+			"  --payload=<filename>  : Path to file containing data to hide.\n"+
+			"  --density=<integer>   : Must be 1, 2, 4 or 8 (default to AUTO).\n"+
+			"  --offset=<integer>    : Must be > 0. This is one of your SECRETS.\n"+
+			"  --obfuscate=<integer> : Use a Fibonacci generator to obfuscate payload. This is one of your SECRETS.\n")
 
 	fmt.Fprintln(os.Stderr, "Examples:")
 	fmt.Fprintln(os.Stderr, "  Get informations about capsule:")
-	fmt.Fprintln(os.Stderr, "  $ steganoWAV --info --wave=boris24.2.wav --offset=5432\n")
+	fmt.Fprintln(os.Stderr, "  $ steganoWAV --wave=boris24.2.wav --offset=5432 --info\n")
 	fmt.Fprintln(os.Stderr, "  Hide source code of steganoWAV:")
-	fmt.Fprintln(os.Stderr, "  $ steganoWAV --hide --wave=boris24.2.wav --offset=5432 --payload=steganoWAV.go\n")
+	fmt.Fprintln(os.Stderr, "  $ steganoWAV --wave=boris24.2.wav --payload=steganoWAV.go --offset=5432 --obfuscate=10 --hide\n")
 	fmt.Fprintln(os.Stderr, "  Extract source code to stdout:")
-	fmt.Fprintln(os.Stderr, "  $ steganoWAV --extract --wave=boris24.2.wav --offset=5432\n")
+	fmt.Fprintln(os.Stderr, "  $ steganoWAV --wave=boris24.2.wav --offset=5432 --obfuscate=10 --extract\n")
 }
 
+// intToSuffixedStr converts integer into string. The string contains decimal value expressed as power of 2^10 by a suffix. 
 func intToSuffixedStr(value uint32) (result string) {
 	var engorder = 0
 	var tempv = float64(value)
