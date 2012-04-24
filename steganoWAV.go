@@ -43,6 +43,11 @@
 //--             Use a Fibonacci generator to obfuscate payload
 //--           * Now, by default, density is auto calculated if not given as option.             
 //--           * version 1.3.0
+//-- 2012-04-25, Stéphane Bunel < stephane [@] bunel [.] org >
+//--           * Add option (not shown in --help) to profile execution --cpuprofile=<filename>
+//--           * Refactor main() to call runAction()
+//--           * Tested on Windows 7 pro (386) with g01             
+//--           * version 1.3.1
 //
 // Building:
 // go build -ldflags "-s" steganoWAV.go
@@ -59,13 +64,14 @@ import (
 	"io"
 	"math"
 	"os"
+	"runtime/pprof"
 	"time"
 )
 
 const (
 	MAJOR    = 1
 	MINOR    = 3
-	REVISION = 0
+	REVISION = 1
 	APP      = "steganoWAV"
 )
 
@@ -81,12 +87,13 @@ type PayloadBloc []byte
 type SamplesBloc []byte
 
 type global_data struct {
-	action    uint   // Action to run
-	data_file string // Path to data file
-	wave_file string // Path to WAVE/PCM file
-	density   uint32 // Bits used per bytes to hide data: 1, 2, 4 or 8
-	offset    uint32 // In sample. This is one of your SECRET
-	obfuscate uint8  // Fibonacci generator for payload obfuscation 
+	action     uint   // Action to run
+	data_file  string // Path to data file
+	wave_file  string // Path to WAVE/PCM file
+	density    uint32 // Bits used per bytes to hide data: 1, 2, 4 or 8
+	offset     uint32 // In sample. This is one of your SECRET
+	obfuscate  uint8  // Fibonacci generator for payload obfuscation
+	cpuprofile string // output cpuprofile into this file 
 }
 
 type wave_info_struct struct {
@@ -664,12 +671,25 @@ func (self *wave_handler_struct) Free() {
 }
 
 func main() {
-	var wh = &wave_handler_struct{bloc_size: 4096}
-	//	var dataf *os.File
+	var rc = 0
 	var err error
 
 	// Read cmd line arguments
-	parseArgs()
+	if err = parseArgs(); err != nil {
+		os.Exit(1)
+	}
+
+	if rc, err = runAction(); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+	}
+
+	os.Exit(rc)
+}
+
+func runAction() (rc int, err error) {
+	var wh = &wave_handler_struct{bloc_size: 4096}
+	var return_code = 0
+
 	defer wh.Free()
 
 	// Init wh
@@ -678,16 +698,29 @@ func main() {
 	wh.fib_1 = gd.obfuscate
 	wh.obfuscate = gd.obfuscate != 0
 
+	// Profiling ?
+	if gd.cpuprofile != "" {
+		fmt.Fprintf(os.Stderr, "Start profiling to %s\n", gd.cpuprofile)
+		f, err := os.Create(gd.cpuprofile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		pprof.StartCPUProfile(f)
+		defer func() {
+			fmt.Fprintf(os.Stderr, "Stop profiling.\n")
+			pprof.StopCPUProfile()
+		}()
+	}
+
 	// Switch over options
 	switch {
 	case gd.action == ACTION_HELP:
 		show_usage()
-		os.Exit(0)
 	case gd.action == ACTION_VERSION:
 		fmt.Println(APP + " (" + os.Args[0] + ") " + VERSION + ".")
 		fmt.Println("Copyright (C) 2012 Stéphane Bunel.")
 		fmt.Println("License: BSD style (included in source code).")
-		os.Exit(0)
 	case gd.action == ACTION_INFO:
 		if err = wh.OpenWave(gd.wave_file, false); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to open \"%s\": %s\n", gd.wave_file, err)
@@ -696,34 +729,38 @@ func main() {
 
 		if err = wh.PrintWAVInfo(os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", err)
+			return_code = 1
 			break
 		}
-		os.Exit(0)
 	case gd.action == ACTION_EXTRACT:
 		if err = wh.OpenWave(gd.wave_file, false); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to open \"%s\": %s\n", gd.wave_file, err)
+			return_code = 1
 			break
 		}
 
 		if err = wh.ExtractPayload(uint32(gd.offset), os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", err)
+			return_code = 1
 			break
 		}
-		os.Exit(0)
 	case gd.action == ACTION_HIDE:
 		if err = wh.OpenWave(gd.wave_file, true); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to open \"%s\": %s\n", gd.wave_file, err)
+			return_code = 1
 			break
 		}
 
 		if wh.density > wh.wave_info.bits_per_sample/2 {
 			fmt.Fprintf(os.Stderr, "Density of %d is too high for sample size of %d bits.\n", wh.density,
 				wh.wave_info.bits_per_sample)
+			return_code = 1
 			break
 		}
 
 		if err = wh.OpenPayload(gd.data_file); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to open \"%s\": %s\n", gd.data_file, err)
+			return_code = 1
 			break
 		}
 
@@ -732,6 +769,7 @@ func main() {
 
 		if err = wh.HidePayload(uint32(gd.offset)); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
+			return_code = 1
 			break
 		}
 
@@ -741,35 +779,38 @@ func main() {
 			intToSuffixedStr(uint32(wh.payload_file_size)), wh.payload_file_name,
 			intToSuffixedStr(byte_writed), wh.wave_file_name,
 			duration, intToSuffixedStr(uint32(float64(byte_writed)/duration.Seconds())))
-		os.Exit(0)
 	}
-	os.Exit(1)
+
+	return return_code, nil
 }
 
 // parseArgs parses command line arguments
-func parseArgs() {
+func parseArgs() (err error) {
 	var print_usage = false
 
-	// Parse command line arguments
-	flag.Usage = show_usage
-	bExtract := flag.Bool("extract", false, "")
-	bHide := flag.Bool("hide", false, "")
-	bInfo := flag.Bool("info", false, "")
-	bVersion := flag.Bool("version", false, "")
+	// Args vars
+	var (
+		bExtract   = flag.Bool("extract", false, "")
+		bHide      = flag.Bool("hide", false, "")
+		bInfo      = flag.Bool("info", false, "")
+		bVersion   = flag.Bool("version", false, "")
+		density    = flag.Uint64("density", 0, "")
+		offset     = flag.Uint64("offset", 0, "")
+		obfuscate  = flag.Uint64("obfuscate", 0, "")
+		cpuprofile = flag.String("cpuprofile", "", "")
+	)
 
 	flag.StringVar(&gd.wave_file, "wave", "", "")
 	flag.StringVar(&gd.data_file, "data", "", "")
 	flag.StringVar(&gd.data_file, "payload", "", "")
 
-	density := flag.Uint64("density", 0, "")
-	offset := flag.Uint64("offset", 0, "")
-	obfuscate := flag.Uint64("obfuscate", 0, "")
-
+	flag.Usage = show_usage
 	flag.Parse()
 
 	gd.density = uint32(*density)
 	gd.offset = uint32(*offset)
 	gd.obfuscate = uint8(*obfuscate)
+	gd.cpuprofile = *cpuprofile
 
 	gd.action = ACTION_HELP
 	if *bHide == true {
@@ -809,8 +850,10 @@ func parseArgs() {
 
 	if print_usage {
 		show_usage()
-		os.Exit(1)
+		return errors.New("Error parsing arguments.")
 	}
+
+	return nil
 }
 
 // Show usage of steganoWAV
