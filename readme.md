@@ -3,19 +3,22 @@ steganoWAV
 
 steganoWAV is a tool for hide/extract data into/from a WAVE/PCM audio file.
 
-Most steganographic tools works on images, but audio files are also good media for that.
-Notably the WAVE/PCM files because they are generaly large.
-They permit to embed more data than in a classical image like PNG.
+Most steganographic tools works on images, but audio files are also a good media for that.
+Notably the WAVE/PCM files because they are generally far larger than images.
+Hence they permit to hide more data per file.
+
+Hiding data in a wave file containing already hidden data will overwrite old data.
+As expected, once hidden, stegano WAV has no way to know if a WAVE file already contains hidden data.
 
 Build and install
 =================
 
-Install Go if needed (http://code.google.com/p/go/downloads/list) to compile source codes.
+If necessary, first install Golang (http://code.google.com/p/go/downloads/list) to compile steganoWAV.
 
     $ go build -ldflags "-s" steganoWAV.go
 
-Once compiled, steganoWAV is a standalone executable file without external dependency (statically compiled).
-You can rename it and put it anywhere.
+Once compiled, steganoWAV become a standalone executable file (for your platform) without external
+dependency (statically linked). You can rename it and put it anywhere.
 
 Usage
 =====
@@ -38,7 +41,7 @@ Usage
     
     Examples:
       Get informations about capsule:
-      $ steganoWAV --wave=boris24.2.wav --offset=5432 --info
+      $ steganoWAV --wave=boris24.2.wav --payload=steganoWAV.go --offset=5432 --info
     
       Hide source code of steganoWAV:
       $ steganoWAV --wave=boris24.2.wav --payload=steganoWAV.go --offset=5432 --obfuscate=10 --hide
@@ -68,25 +71,36 @@ When you need, extract your secrets from your WAVE Audio file:
     $ steganoWAV --wave=boris.wav --offset=5432 --obfuscate=10 --extract
     My very secret data
 
+Mac OS X
+--------
+ 
+Hiding:
+ 
+    $ steganoWAV --wave=/Users/toto/Desktop/03RedSister.wav --payload=/Users/toto/Documents/NdF-2012_04.xls --offset=4321 --obfuscate=99 --hide
+
+Extracting:
+ 
+    $ steganoWAV --wave=/Users/toto/Music/03RedSister.wav --offset=4321 --obfuscate=99 --extract >/Users/toto/Desktop/test.xls
+
 Windows
 -------
 
 Hiding:
 
-    C:\Users\toto\Desktop\steganoWAV\steganoWAV>steganoWAV.exe --wave 07Narayan.wav --payload steganoWAV.go --offset 5432 --obfuscate 10 --hide
+    C:\Users\(...)\steganoWAV>steganoWAV.exe --wave 07Narayan.wav --payload steganoWAV.go --offset 5432 --obfuscate 10 --hide
     Hiding "steganoWAV.go" inside "07Narayan.wav" ...
     Read 27.775 KiB from "steganoWAV.go" and write 222.203 KiB to "07Narayan.wav" in 20.0464ms (10.825 MiB/s).
 
 Extracting:
 
-    C:\Users\toto\Desktop\steganoWAV\steganoWAV>steganoWAV.exe --wave 07Narayan.wav --offset 5432 --obfuscate 10 --extract
+    C:\Users\(...)\steganoWAV>steganoWAV.exe --wave 07Narayan.wav --offset 5432 --obfuscate 10 --extract
     ...
     (listing of source code)
     ...
 
 Infos about capsule:
 
-    C:\Users\toto\Desktop\steganoWAV\steganoWAV>steganoWAV.exe --wave 07Narayan.wav --offset 5432 --info
+    C:\Users\(...)\steganoWAV>steganoWAV.exe --wave 07Narayan.wav --offset 5432 --info
     WAVE Audio file informations
     ============================
       File path                      : "07Narayan.wav"
@@ -117,6 +131,20 @@ SteganoWAV has been reproted to compiles and runs correctly on the following pla
 
   * Linux 2.6 (amd_64, developpement platform).
   * Windows 7 pro (386).
-  * Mac OS X Snow Leopard (amd_64). Thanks to Sébastien Lecomte.
-  * Mac OS X Lion (amd_64). Thanks to Sébastien Lecomte.
+  * Mac OS X 10.6 Snow Leopard (amd_64). Thanks to seblec.
+  * Mac OS X 10.7 Lion (amd_64). Thanks to seblec.
+
+FAQ
+===
+
+Q: Can I compress a WAVE audio file with hidden data inside ?
+
+A: Yes, but only with a lossless algorithms, like FLAC. By using a lossy algorithm (MP3, OGG, ...) all hidden data will be destroyed.
+
+
+Q: Can I hide more than one "file" in the same WAVE audio file ?
+
+A: Yes, by adjusting smartly the offset to avoid data overlapping.
+Use --info with --wave and --payload to get offset informations.
+
 
